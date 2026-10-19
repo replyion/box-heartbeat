@@ -1,12 +1,9 @@
 name: freeze-watch
-# Runs on GitHub-hosted runners (free), independent of the box — so it still fires when the box is frozen.
+# Runs on GitHub-hosted runners (free), independent of the box.
 on:
   schedule:
     - cron: '*/30 * * * *'
   workflow_dispatch:
-  push:
-    paths:
-      - 'heartbeat/latest.json'
 
 permissions:
   contents: read
@@ -27,9 +24,8 @@ jobs:
         with:
           script: |
             const fs = require('fs');
-            const path = 'heartbeat/latest.json';
             let raw;
-            try { raw = fs.readFileSync(path, 'utf8'); }
+            try { raw = fs.readFileSync('heartbeat/latest.json', 'utf8'); }
             catch (e) {
               core.setOutput('stale', 'true');
               core.setOutput('age_min', '9999');
@@ -45,15 +41,17 @@ jobs:
             core.setOutput('ts', data.ts || 'invalid');
             console.log(JSON.stringify({ ts: data.ts, ageMin, stale }));
 
-      - name: Open or keep single freeze issue (email assignee)
+      - name: Open or keep single freeze issue
         if: steps.eval.outputs.stale == 'true'
+        env:
+          HB_AGE: ${{ steps.eval.outputs.age_min }}
+          HB_TS: ${{ steps.eval.outputs.ts }}
         uses: actions/github-script@v7
         with:
           script: |
-            const age = '${{ steps.eval.outputs.age_min }}';
-            const ts = '${{ steps.eval.outputs.ts }}';
+            const age = process.env.HB_AGE;
+            const ts = process.env.HB_TS;
             const label = 'box-freeze';
-            // ensure label
             try {
               await github.rest.issues.getLabel({ owner: context.repo.owner, repo: context.repo.repo, name: label });
             } catch {
@@ -67,41 +65,54 @@ jobs:
               state: 'open', labels: label, per_page: 5
             });
             if (open.data.length > 0) {
-              // Dedup: one email/issue per outage — just comment a keepalive every few hours max
-              const issue = open.data[0];
-              console.log(`Already open #${issue.number}; no new issue (dedupe)`);
+              console.log('Already open #' + open.data[0].number + '; dedupe — no new issue/email');
               return;
             }
             const body = [
               '## Box freeze / heartbeat stale',
               '',
-              `Last heartbeat: \`${ts}\` (age **${age}** minutes; threshold 60).`,
+              'Last heartbeat: `' + ts + '` (age **' + age + '** minutes; threshold 60).',
               '',
               'The Replyion box has not pushed `heartbeat/latest.json` for over an hour.',
               'Likely a platform freeze. CI runners and Claude Code will stall until it thaws.',
               '',
-              '**Notify:** juangabrielarca10@gmail.com (via GitHub assignee email).',
+              '**Email target:** juangabrielarca10@gmail.com',
+              'Watch this repo (Issues) or accept the collaborator invite so GitHub emails you on new `box-freeze` issues.',
               '',
               'This issue auto-closes when the heartbeat recovers.',
               '',
-              '_Workflow: freeze-watch · no secrets · no paid services · no COCO usage._'
+              '_freeze-watch · no secrets · no paid services · no COCO usage_'
             ].join('\n');
             const created = await github.rest.issues.create({
               owner: context.repo.owner,
               repo: context.repo.repo,
-              title: `BOX FREEZE: heartbeat ${age}m old (threshold 60m)`,
+              title: 'BOX FREEZE: heartbeat ' + age + 'm old (threshold 60m)',
               body,
               labels: [label],
               assignees: ['juangabrielarca10-arch']
+            }).catch(async (e) => {
+              console.log('create with assignee failed: ' + e.message);
+              return github.rest.issues.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title: 'BOX FREEZE: heartbeat ' + age + 'm old (threshold 60m)',
+                body,
+                labels: [label]
+              });
             });
-            console.log(`Opened #${created.data.number}`);
+            console.log('Opened #' + created.data.number);
 
       - name: Close freeze issue on recovery
         if: steps.eval.outputs.stale == 'false'
+        env:
+          HB_AGE: ${{ steps.eval.outputs.age_min }}
+          HB_TS: ${{ steps.eval.outputs.ts }}
         uses: actions/github-script@v7
         with:
           script: |
             const label = 'box-freeze';
+            const ts = process.env.HB_TS;
+            const age = process.env.HB_AGE;
             const open = await github.rest.issues.listForRepo({
               owner: context.repo.owner, repo: context.repo.repo,
               state: 'open', labels: label, per_page: 10
@@ -110,11 +121,11 @@ jobs:
               await github.rest.issues.createComment({
                 owner: context.repo.owner, repo: context.repo.repo,
                 issue_number: issue.number,
-                body: `Heartbeat recovered at \`${{ steps.eval.outputs.ts }}\` (age ${{ steps.eval.outputs.age_min }}m). Closing.`
+                body: 'Heartbeat recovered at `' + ts + '` (age ' + age + 'm). Closing.'
               });
               await github.rest.issues.update({
                 owner: context.repo.owner, repo: context.repo.repo,
                 issue_number: issue.number, state: 'closed'
               });
-              console.log(`Closed #${issue.number}`);
+              console.log('Closed #' + issue.number);
             }
